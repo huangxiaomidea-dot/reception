@@ -382,7 +382,7 @@ textarea.inp{resize:vertical;min-height:88px;line-height:1.6}
           <div class="ai-box">
             <h4>📋 批量识别人员</h4>
             <div class="ai-row">
-              <textarea class="ai-ta" id="ai-input" placeholder="粘贴人员名单，支持：&#10;姓名[Tab]职务&#10;姓名  职务&#10;&#10;例：&#10;郭  亮&#9;珍酒李渡集团副总裁&#10;杨  铮&#9;贵州珍酒华南大区总监"></textarea>
+              <textarea class="ai-ta" id="ai-input" placeholder="粘贴人员名单，AI自动识别姓名和职务&#10;无论谁在前面都能正确区分&#10;&#10;例：&#10;郭  亮  珍酒李渡集团副总裁&#10;珍酒华南大区总监  杨铮&#10;总裁  李明  华南区"></textarea>
               <div style="display:flex;flex-direction:column;gap:6px;align-self:flex-end">
                 <select id="m-co-ai" style="border:1px solid #c0d8f5;border-radius:4px;padding:5px 7px;font-family:inherit;font-size:12px;color:#222;background:#fff">
                   <option value="zte" id="ai-co-zte">加入来访方</option>
@@ -391,7 +391,7 @@ textarea.inp{resize:vertical;min-height:88px;line-height:1.6}
                 <button class="ai-btn" id="ai-btn" onclick="aiRecognize()">识别添加</button>
               </div>
             </div>
-            <div class="ai-tip">支持 Tab 分隔或多空格分隔，每行一人；识别后自动更新名单</div>
+            <div class="ai-tip">AI智能识别：姓名/职务无论谁在前面均可自动区分；2字姓名自动补空格；识别后自动更新名单</div>
           </div>
           <div style="margin-bottom:14px">
             <div style="font-size:12px;font-weight:700;color:#1a3a6b;margin-bottom:6px;display:flex;align-items:center;justify-content:space-between"><span id="zte-dt-lbl">来访方</span><button onclick="clearPeople('zte')" style="background:none;border:1px solid #ddd;border-radius:4px;padding:2px 8px;font-size:11px;color:#888;cursor:pointer;font-family:inherit" title="清空来访方名单">清空</button></div>
@@ -1194,52 +1194,127 @@ function addHist() { histData.push({ date: '', desc: '' }); renderHist(); }
 function delHist(i) { histData.splice(i, 1); renderHist(); }
 
 // ===== AI RECOGNIZE =====
-function aiRecognize() {
+// 对2字人名中间插入2个空格
+function padTwoCharName(name) {
+  var clean = name.replace(/\s/g, '');
+  if (clean.length === 2) return clean[0] + '　　' + clean[1];
+  return name;
+}
+
+// 将 AI 返回的 JSON 数组解析为 [{name, title}]
+function parseAiPersonJson(text) {
+  var results = [];
+  try {
+    var m = text.match(/\[[\s\S]*\]/);
+    if (!m) return results;
+    var arr = JSON.parse(m[0]);
+    if (!Array.isArray(arr)) return results;
+    arr.forEach(function(item) {
+      var name = (item.name || item.姓名 || '').trim();
+      var title = (item.title || item.职务 || '').trim();
+      if (name) results.push({ name: padTwoCharName(name), title: title });
+    });
+  } catch(e) {}
+  return results;
+}
+
+async function aiRecognize() {
   var text = document.getElementById('ai-input').value.trim();
   if (!text) { alert('请先粘贴人员信息文本'); return; }
   var co = document.getElementById('m-co-ai') ? document.getElementById('m-co-ai').value : 'zte';
-  var parsed = parsePersonText(text);
-  if (!parsed.length) { alert('未识别到人员信息，请检查格式'); return; }
-  var added = 0;
-  parsed.forEach(function(p) {
-    if (!DATA[co].some(function(e){ return e.name.trim() === p.name.trim(); })) {
-      DATA[co].push({ name: p.name, title: p.title });
-      added++;
+  var coLabel = co === 'zte' ? (document.getElementById('f-co').value || '来访方') : '美的集团';
+  var btn = document.getElementById('ai-btn');
+  var origText = btn.textContent;
+  btn.disabled = true; btn.textContent = '识别中…';
+
+  try {
+    var prompt = '请从以下文本中识别所有人员的姓名和职务，无论姓名和职务谁在前面都要正确区分。\n' +
+      '姓名通常是2-4个汉字，职务是描述工作岗位的词语（如总裁、总监、经理、副总裁、董事长等）。\n' +
+      '严格按JSON数组格式输出，每个对象只含 name 和 title 两个字段，不要输出任何其他内容。\n' +
+      '示例输出：[{"name":"张三","title":"总经理"},{"name":"李四","title":"副总裁"}]\n\n' +
+      '待识别文本：\n' + text;
+
+    var resp = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer sk-ws-H.RYEYMHE.X4g6.MEQCIEaYi0b9Rh5s1BSD8PX84Wn9b2Wb-UodDjygCQNKjjfkAiA0_wmadB-pctfM8uZUW3U9IMFL9yW1TdK0AIbUa7NCLQ',
+        'X-DashScope-SSE': 'disable'
+      },
+      body: JSON.stringify({
+        model: 'qwen-plus',
+        messages: [
+          { role: 'system', content: '你是一个数据提取助手，只输出JSON，不输出任何解释。' },
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 1000,
+        temperature: 0.1
+      })
+    });
+
+    var parsed = [];
+    if (resp.ok) {
+      var data = await resp.json();
+      var aiText = (data.choices && data.choices[0] && data.choices[0].message)
+        ? data.choices[0].message.content : '';
+      parsed = parseAiPersonJson(aiText);
     }
-  });
-  renderSidebar(); reRenderPickers();
-  document.getElementById('ai-input').value = '';
-  alert('识别完成！新增 ' + added + ' 人到' + (co === 'zte' ? document.getElementById('f-co').value || '来访方' : '美的集团'));
+
+    // AI 失败则降级本地解析
+    if (!parsed.length) parsed = parsePersonTextLocal(text);
+
+    if (!parsed.length) { alert('未识别到人员信息，请检查格式'); return; }
+    var added = 0;
+    parsed.forEach(function(p) {
+      if (!DATA[co].some(function(e){ return e.name.replace(/\s/g,'') === p.name.replace(/\s/g,''); })) {
+        DATA[co].push({ name: p.name, title: p.title });
+        added++;
+      }
+    });
+    renderSidebar(); reRenderPickers();
+    document.getElementById('ai-input').value = '';
+    alert('识别完成！新增 ' + added + ' 人到' + coLabel);
+  } catch(err) {
+    // 网络失败降级本地解析
+    var parsed2 = parsePersonTextLocal(text);
+    if (!parsed2.length) { alert('识别失败：' + (err.message || err)); return; }
+    var added2 = 0;
+    parsed2.forEach(function(p) {
+      if (!DATA[co].some(function(e){ return e.name.replace(/\s/g,'') === p.name.replace(/\s/g,''); })) {
+        DATA[co].push({ name: p.name, title: p.title });
+        added2++;
+      }
+    });
+    renderSidebar(); reRenderPickers();
+    document.getElementById('ai-input').value = '';
+    alert('AI识别不可用，已用本地解析，新增 ' + added2 + ' 人到' + coLabel);
+  } finally {
+    btn.disabled = false; btn.textContent = origText;
+  }
 }
 
-// 本地解析人员文本：支持 Tab 分隔、多空格分隔、换行分隔
-function parsePersonText(text) {
+// 本地解析人员文本（降级用）：支持 Tab 分隔、多空格分隔、换行分隔
+function parsePersonTextLocal(text) {
   var results = [];
   var lines = text.split(/[\r\n]+/);
   lines.forEach(function(line) {
     line = line.trim();
     if (!line) return;
     var name = '', title = '';
-    // Tab 分隔（最精确）
     if (line.indexOf('\t') !== -1) {
       var parts = line.split('\t');
       name = parts[0].trim();
       title = parts.slice(1).join(' ').trim();
     } else {
-      // 空格分隔：
-      // 优先匹配 "X  X 职务"（双空格名字）
       var m1 = line.match(/^(\S\s{2,}\S+)\s+(.+)$/);
       if (m1) {
         name = m1[1].trim(); title = m1[2].trim();
       } else {
-        // 匹配普通 "姓名 职务"，姓名≤4字
-        // 找第一个空格，前面是名字（不超过4个汉字）
         var spIdx = line.search(/\s+/);
         if (spIdx > 0 && spIdx <= 4) {
           name = line.substring(0, spIdx).trim();
           title = line.substring(spIdx).trim();
         } else if (spIdx > 0) {
-          // 超过4字，可能整行都是名字或有其他格式
           name = line.substring(0, spIdx).trim();
           title = line.substring(spIdx).trim();
         } else {
@@ -1247,10 +1322,13 @@ function parsePersonText(text) {
         }
       }
     }
-    if (name) results.push({ name: name, title: title });
+    if (name) results.push({ name: padTwoCharName(name), title: title });
   });
   return results;
 }
+
+// 保持旧名兼容（部分地方可能调用）
+function parsePersonText(text) { return parsePersonTextLocal(text); }
 
 // ===== AUTO BACKGROUND =====
 async function autoFillBackground() {
