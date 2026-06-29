@@ -1218,6 +1218,57 @@ function parseAiPersonJson(text) {
   return results;
 }
 
+// 判断是否像中文人名（2-4个汉字，允许·间隔）
+function isCnName(s) {
+  return /^[一-龥·]{2,4}$/.test((s || '').replace(/\s/g, ''));
+}
+
+// 智能解析单行：自动识别姓名/职务顺序
+function parseOneLine(line) {
+  line = line.trim();
+  if (!line) return null;
+
+  // Tab 分隔
+  if (line.indexOf('\t') !== -1) {
+    var tp = line.split('\t').map(function(s){ return s.trim(); });
+    if (isCnName(tp[0])) return { name: tp[0], title: tp.slice(1).join('') };
+    if (isCnName(tp[tp.length-1])) return { name: tp[tp.length-1], title: tp.slice(0,-1).join('') };
+    return { name: tp[0], title: tp.slice(1).join(' ') };
+  }
+
+  // 按空白分词
+  var tokens = line.split(/\s+/).filter(Boolean);
+  if (tokens.length === 1) return { name: line, title: '' };
+
+  var first = tokens[0], last = tokens[tokens.length - 1];
+  var firstIsName = isCnName(first), lastIsName = isCnName(last);
+
+  // 末尾是人名、开头不是 → 职务在前（最常见：英科集团董事长 刘方毅）
+  if (lastIsName && !firstIsName) {
+    return { name: last, title: tokens.slice(0, -1).join('') };
+  }
+  // 开头是人名、末尾不是 → 姓名在前（郭  亮  副总裁）
+  if (firstIsName && !lastIsName) {
+    return { name: first, title: tokens.slice(1).join('') };
+  }
+  // 两端都像人名（如"张三 李四"这种异常情况）→ 默认末尾是姓名
+  if (lastIsName) {
+    return { name: last, title: tokens.slice(0, -1).join('') };
+  }
+  // 都不像人名：取第一个词为姓名
+  return { name: first, title: tokens.slice(1).join(' ') };
+}
+
+// 本地智能解析（主力）
+function parsePersonTextLocal(text) {
+  var results = [];
+  text.split(/[\r\n]+/).forEach(function(line) {
+    var p = parseOneLine(line);
+    if (p && p.name) results.push({ name: padTwoCharName(p.name), title: p.title });
+  });
+  return results;
+}
+
 async function aiRecognize() {
   var text = document.getElementById('ai-input').value.trim();
   if (!text) { alert('请先粘贴人员信息文本'); return; }
@@ -1227,12 +1278,17 @@ async function aiRecognize() {
   var origText = btn.textContent;
   btn.disabled = true; btn.textContent = '识别中…';
 
+  // 先用本地解析（快速且准确）
+  var localParsed = parsePersonTextLocal(text);
+  var lineCount = text.split(/[\r\n]+/).filter(function(l){ return l.trim(); }).length;
+
   try {
-    var prompt = '请从以下文本中识别所有人员的姓名和职务，无论姓名和职务谁在前面都要正确区分。\n' +
-      '姓名通常是2-4个汉字，职务是描述工作岗位的词语（如总裁、总监、经理、副总裁、董事长等）。\n' +
-      '严格按JSON数组格式输出，每个对象只含 name 和 title 两个字段，不要输出任何其他内容。\n' +
-      '示例输出：[{"name":"张三","title":"总经理"},{"name":"李四","title":"副总裁"}]\n\n' +
-      '待识别文本：\n' + text;
+    var prompt = '以下文本共' + lineCount + '行，每行一人，请识别每行的姓名和职务。\n' +
+      '规则：姓名是2-4个汉字；职务是描述岗位的词（含公司名），姓名可能在行首也可能在行尾。\n' +
+      '必须输出' + lineCount + '个对象，不能遗漏任何一行。\n' +
+      '只输出JSON数组，格式：[{"name":"姓名","title":"职务"},...]\n' +
+      '不要输出任何解释或其他内容。\n\n' +
+      '文本：\n' + text;
 
     var resp = await fetch('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', {
       method: 'POST',
@@ -1244,24 +1300,24 @@ async function aiRecognize() {
       body: JSON.stringify({
         model: 'qwen-plus',
         messages: [
-          { role: 'system', content: '你是一个数据提取助手，只输出JSON，不输出任何解释。' },
+          { role: 'system', content: '你是数据提取助手，只输出JSON数组，不输出任何解释。' },
           { role: 'user', content: prompt }
         ],
-        max_tokens: 1000,
-        temperature: 0.1
+        max_tokens: 2000,
+        temperature: 0.0
       })
     });
 
-    var parsed = [];
+    var aiParsed = [];
     if (resp.ok) {
       var data = await resp.json();
       var aiText = (data.choices && data.choices[0] && data.choices[0].message)
         ? data.choices[0].message.content : '';
-      parsed = parseAiPersonJson(aiText);
+      aiParsed = parseAiPersonJson(aiText);
     }
 
-    // AI 失败则降级本地解析
-    if (!parsed.length) parsed = parsePersonTextLocal(text);
+    // 取本地和AI结果中数量更多的那个
+    var parsed = (aiParsed.length >= localParsed.length && aiParsed.length > 0) ? aiParsed : localParsed;
 
     if (!parsed.length) { alert('未识别到人员信息，请检查格式'); return; }
     var added = 0;
@@ -1275,11 +1331,10 @@ async function aiRecognize() {
     document.getElementById('ai-input').value = '';
     alert('识别完成！新增 ' + added + ' 人到' + coLabel);
   } catch(err) {
-    // 网络失败降级本地解析
-    var parsed2 = parsePersonTextLocal(text);
-    if (!parsed2.length) { alert('识别失败：' + (err.message || err)); return; }
+    // 网络失败直接用本地解析结果
+    if (!localParsed.length) { alert('识别失败：' + (err.message || err)); return; }
     var added2 = 0;
-    parsed2.forEach(function(p) {
+    localParsed.forEach(function(p) {
       if (!DATA[co].some(function(e){ return e.name.replace(/\s/g,'') === p.name.replace(/\s/g,''); })) {
         DATA[co].push({ name: p.name, title: p.title });
         added2++;
@@ -1287,47 +1342,13 @@ async function aiRecognize() {
     });
     renderSidebar(); reRenderPickers();
     document.getElementById('ai-input').value = '';
-    alert('AI识别不可用，已用本地解析，新增 ' + added2 + ' 人到' + coLabel);
+    alert('识别完成（本地解析）！新增 ' + added2 + ' 人到' + coLabel);
   } finally {
     btn.disabled = false; btn.textContent = origText;
   }
 }
 
-// 本地解析人员文本（降级用）：支持 Tab 分隔、多空格分隔、换行分隔
-function parsePersonTextLocal(text) {
-  var results = [];
-  var lines = text.split(/[\r\n]+/);
-  lines.forEach(function(line) {
-    line = line.trim();
-    if (!line) return;
-    var name = '', title = '';
-    if (line.indexOf('\t') !== -1) {
-      var parts = line.split('\t');
-      name = parts[0].trim();
-      title = parts.slice(1).join(' ').trim();
-    } else {
-      var m1 = line.match(/^(\S\s{2,}\S+)\s+(.+)$/);
-      if (m1) {
-        name = m1[1].trim(); title = m1[2].trim();
-      } else {
-        var spIdx = line.search(/\s+/);
-        if (spIdx > 0 && spIdx <= 4) {
-          name = line.substring(0, spIdx).trim();
-          title = line.substring(spIdx).trim();
-        } else if (spIdx > 0) {
-          name = line.substring(0, spIdx).trim();
-          title = line.substring(spIdx).trim();
-        } else {
-          name = line; title = '';
-        }
-      }
-    }
-    if (name) results.push({ name: padTwoCharName(name), title: title });
-  });
-  return results;
-}
-
-// 保持旧名兼容（部分地方可能调用）
+// 保持旧名兼容
 function parsePersonText(text) { return parsePersonTextLocal(text); }
 
 // ===== AUTO BACKGROUND =====
