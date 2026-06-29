@@ -1197,7 +1197,7 @@ function delHist(i) { histData.splice(i, 1); renderHist(); }
 // 对2字人名中间插入2个空格
 function padTwoCharName(name) {
   var clean = name.replace(/\s/g, '');
-  if (clean.length === 2) return clean[0] + '　　' + clean[1];
+  if (clean.length === 2) return clean[0] + '  ' + clean[1];
   return name;
 }
 
